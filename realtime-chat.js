@@ -140,7 +140,15 @@
     if(!client)return toast('El chat real todavía no está configurado');
     const button=form.querySelector('button');button.disabled=true;button.textContent='Ingresando…';
     const {error}=await client.auth.signInWithPassword({email,password});
-    if(error){console.error(error);button.disabled=false;button.textContent='Ingresar';return toast('No se pudo validar el acceso administrativo')}
+    if(error){
+      console.error('Supabase admin sign-in failed:',error);
+      // El acceso al panel demostrativo debe seguir disponible aunque Supabase
+      // esté pausado o sin conexión. El chat seguirá indicando su estado remoto.
+      session={role:'admin',id:admin.id};screen='internal';page='home';save();app();
+      chatState='error';
+      toast('Entraste al panel demostrativo. El chat remoto no está disponible.');
+      return;
+    }
     session={role:'admin',id:admin.id};screen='internal';page='home';save();app();loadAdminChats();
   }
 
@@ -150,7 +158,7 @@
   function realtimeAdminChats(){
     const status=`<div class="chat-sync">${chatState==='online'?'Sincronización en tiempo real activa':'Conectando con las consultas…'}</div>`;
     const cards=db.chats.length?db.chats.map(c=>`<article class="card"><div class="row"><div><h2>${esc(c.name)}</h2><div class="meta">${esc(c.contact||'Sin contacto')}</div></div><span class="badge ${c.status==='open'?'amber':'green'}">${c.status==='open'?'Abierta':'Atendida'}</span></div><div class="chat-card-messages">${c.messages.map(m=>`<div class="bubble ${m.from==='client'?'client':'company'}">${esc(m.text)}<small>${new Date(m.time).toLocaleTimeString('es-UY',{hour:'2-digit',minute:'2-digit'})}</small></div>`).join('')}</div><form onsubmit="adminReply(event,'${c.id}')"><div class="row"><input class="input" name="text" maxlength="2000" required placeholder="Responder como TaskForce"><button class="btn primary">Enviar</button></div></form><div class="actions"><button class="btn small" onclick="createFromChat('${c.id}')">Convertir en trabajo</button><button class="btn small ghost" onclick="closeChatCase('${c.id}')">Marcar atendida</button></div></article>`).join(''):`<div class="card chat-empty">${empty('Todavía no hay consultas reales')}</div>`;
-    return head('Atención comercial','Consultas de clientes','Los mensajes se sincronizan entre celulares y computadoras en tiempo real.')+status+`<div class="grid two">${cards}</div>`;
+    return head('Atención comercial','Consultas de clientes','Los mensajes se sincronizan entre celulares y computadoras en tiempo real.')+(chatState==='error'?'<div class="chat-alert">Chat remoto sin conexión. El panel sigue disponible; los mensajes nuevos se sincronizarán al restablecer Supabase.</div>':'')+status+`<div class="grid two">${cards}</div>`;
   }
 
   window.renderChat=renderRealtimeChat;
