@@ -46,7 +46,7 @@
       subscribePublic(id);
       chatState='online';
       if(chatOpen)renderChat();
-    }catch(error){console.error('TaskForce chat:',error);chatState='error';if(chatOpen)renderChat()}
+    }catch(error){console.error('TaskForce chat:',error);chatState='error';localDemoMode=true;if(chatOpen)originalRenderChat()}
   }
 
   function subscribePublic(id){
@@ -63,7 +63,7 @@
 
   async function startRealtimeChat(event){
     event.preventDefault();
-    if(!client)return;
+    if(!client){localDemoMode=true;originalRenderChat();return}
     const form=event.currentTarget,button=form.querySelector('button');
     button.disabled=true;
     try{
@@ -74,7 +74,7 @@
       publicConversation=conversationShape(conversation);publicMessages=[];chatState='online';
       subscribePublic(conversation.id);
       await loadPublicConversation();
-    }catch(error){console.error(error);chatState='error';toast('No pudimos iniciar el chat. Intentá nuevamente.');renderChat()}
+    }catch(error){console.error(error);chatState='error';localDemoMode=true;toast('Chat local de demostración activado.');originalRenderChat()}
     finally{button.disabled=false}
   }
 
@@ -110,7 +110,7 @@
       if(ids.length){const result=await client.from('chat_messages').select('*').in('conversation_id',ids).order('created_at');if(result.error)throw result.error;messages=result.data||[]}
       db.chats=(conversations||[]).map(c=>conversationShape(c,messages.filter(m=>m.conversation_id===c.id).map(messageShape)));
       save();chatState='online';subscribeAdmin();app();
-    }catch(error){console.error('TaskForce admin chat:',error);chatState='error';toast('No se pudieron sincronizar las consultas')}
+    }catch(error){console.error('TaskForce admin chat:',error);chatState='error';localDemoMode=true;app();toast('Chat local de demostración activado.')}
     finally{adminLoading=false}
   }
 
@@ -133,20 +133,31 @@
   async function realtimeCloseChat(id){const {error}=await client.from('chat_conversations').update({status:'closed'}).eq('id',id);if(error)return toast('No se pudo cerrar la consulta');toast('Consulta marcada como atendida')}
 
   const originalLogin=window.login;
+  const originalRenderChat=window.renderChat;
+  const originalToggleChat=window.toggleChat;
+  const originalSendPublicMessage=window.sendPublicMessage;
+  const originalAdminReply=window.adminReply;
+  const originalAdminChats=window.adminChats;
+  const originalCloseChatCase=window.closeChatCase;
+  let localDemoMode=false;
+  function enterLocalDemo(admin,button){
+    localDemoMode=true;chatState='error';
+    session={role:'admin',id:admin.id};screen='internal';page='home';save();app();
+    toast('Panel y chat demostrativo listos en este navegador.');
+    if(button){button.disabled=false;button.textContent='Ingresar'}
+  }
   async function realtimeLogin(event){
     event.preventDefault();const form=event.currentTarget,data=new FormData(form),email=String(data.get('email')).toLowerCase(),password=String(data.get('password'));
     const admin=db.admins.find(x=>x.email===email&&x.password===password);
     if(!admin)return originalLogin(event);
-    if(!client)return toast('El chat real todavía no está configurado');
+    if(!client){enterLocalDemo(admin,form.querySelector('button'));return}
     const button=form.querySelector('button');button.disabled=true;button.textContent='Ingresando…';
-    const {error}=await client.auth.signInWithPassword({email,password});
-    if(error){
-      console.error('Supabase admin sign-in failed:',error);
-      // El acceso al panel demostrativo debe seguir disponible aunque Supabase
-      // esté pausado o sin conexión. El chat seguirá indicando su estado remoto.
-      session={role:'admin',id:admin.id};screen='internal';page='home';save();app();
-      chatState='error';
-      toast('Entraste al panel demostrativo. El chat remoto no está disponible.');
+    try{
+      const {error}=await client.auth.signInWithPassword({email,password});
+      if(error)throw error;
+    }catch(error){
+      console.error('Supabase admin sign-in failed; using local demo:',error);
+      enterLocalDemo(admin,button);
       return;
     }
     session={role:'admin',id:admin.id};screen='internal';page='home';save();app();loadAdminChats();
@@ -156,24 +167,30 @@
   async function realtimeLogout(){if(client&&session?.role==='admin')await client.auth.signOut();if(adminChannel){client.removeChannel(adminChannel);adminChannel=null}originalLogout();loadPublicConversation()}
 
   function realtimeAdminChats(){
+    if(localDemoMode)return head('Atención comercial','Consultas de clientes','Chat demostrativo local: los mensajes se guardan en este navegador y administración puede responder desde aquí.')+`<div class="chat-alert">Modo demostración local. Para sincronizar con otros dispositivos hay que reactivar Supabase.</div>`+originalAdminChats();
     const status=`<div class="chat-sync">${chatState==='online'?'Sincronización en tiempo real activa':'Conectando con las consultas…'}</div>`;
     const cards=db.chats.length?db.chats.map(c=>`<article class="card"><div class="row"><div><h2>${esc(c.name)}</h2><div class="meta">${esc(c.contact||'Sin contacto')}</div></div><span class="badge ${c.status==='open'?'amber':'green'}">${c.status==='open'?'Abierta':'Atendida'}</span></div><div class="chat-card-messages">${c.messages.map(m=>`<div class="bubble ${m.from==='client'?'client':'company'}">${esc(m.text)}<small>${new Date(m.time).toLocaleTimeString('es-UY',{hour:'2-digit',minute:'2-digit'})}</small></div>`).join('')}</div><form onsubmit="adminReply(event,'${c.id}')"><div class="row"><input class="input" name="text" maxlength="2000" required placeholder="Responder como TaskForce"><button class="btn primary">Enviar</button></div></form><div class="actions"><button class="btn small" onclick="createFromChat('${c.id}')">Convertir en trabajo</button><button class="btn small ghost" onclick="closeChatCase('${c.id}')">Marcar atendida</button></div></article>`).join(''):`<div class="card chat-empty">${empty('Todavía no hay consultas reales')}</div>`;
     return head('Atención comercial','Consultas de clientes','Los mensajes se sincronizan entre celulares y computadoras en tiempo real.')+(chatState==='error'?'<div class="chat-alert">Chat remoto sin conexión. El panel sigue disponible; los mensajes nuevos se sincronizarán al restablecer Supabase.</div>':'')+status+`<div class="grid two">${cards}</div>`;
   }
 
   window.renderChat=renderRealtimeChat;
-  window.toggleChat=function(){chatOpen=!chatOpen;renderRealtimeChat();if(chatOpen&&!publicConversation)loadPublicConversation()};
+  window.toggleChat=function(){if(localDemoMode){originalToggleChat();return}chatOpen=!chatOpen;renderRealtimeChat();if(chatOpen&&!publicConversation)loadPublicConversation()};
   window.startRealtimeChat=startRealtimeChat;
-  window.sendPublicMessage=sendRealtimeMessage;
+  window.sendPublicMessage=function(event){if(localDemoMode){originalSendPublicMessage(event);return}sendRealtimeMessage(event)};
   window.login=realtimeLogin;
   window.logout=realtimeLogout;
-  window.adminReply=realtimeAdminReply;
-  window.closeChatCase=realtimeCloseChat;
+  window.adminReply=function(event,id){if(localDemoMode){originalAdminReply(event,id);return}realtimeAdminReply(event,id)};
+  window.closeChatCase=function(id){if(localDemoMode){originalCloseChatCase(id);return}realtimeCloseChat(id)};
   window.adminChats=realtimeAdminChats;
 
   if(configured){
     client.auth.onAuthStateChange((event,current)=>{if(event==='SIGNED_IN'&&current?.user?.email&&session?.role==='admin')setTimeout(loadAdminChats,0)});
-    if(session?.role==='admin')loadAdminChats();else loadPublicConversation();
+    if(session?.role==='admin'){
+      // La sesión demo guardada debe dejar entrar al panel aunque el backend no responda.
+      if(!navigator.onLine||!client){localDemoMode=true;chatState='error'}
+      else loadAdminChats();
+    }else if(!configured){localDemoMode=true;chatState='error'}
+    else loadPublicConversation();
   }
   app();
 })();
