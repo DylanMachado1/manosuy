@@ -46,7 +46,7 @@
       subscribePublic(id);
       chatState='online';
       if(chatOpen)renderChat();
-    }catch(error){console.error('TaskForce chat:',error);chatState='error';localDemoMode=true;if(chatOpen)originalRenderChat()}
+    }catch(error){console.error('TaskForce chat:',error);chatState='error';localDemoMode=true;if(chatOpen)renderLocalChat()}
   }
 
   function subscribePublic(id){
@@ -74,11 +74,12 @@
       publicConversation=conversationShape(conversation);publicMessages=[];chatState='online';
       subscribePublic(conversation.id);
       await loadPublicConversation();
-    }catch(error){console.error(error);chatState='error';localDemoMode=true;toast('Chat local de demostración activado.');originalRenderChat()}
+    }catch(error){console.error(error);chatState='error';localDemoMode=true;toast('Chat local de demostración activado.');renderLocalChat()}
     finally{button.disabled=false}
   }
 
   function renderRealtimeChat(){
+    if(localDemoMode){renderLocalChat();return}
     const root=document.getElementById('chat-root');if(!root)return;
     if(!chatOpen){root.innerHTML='';return}
     document.querySelector('.chat-launch .unread')?.classList.remove('live');
@@ -167,30 +168,39 @@
   async function realtimeLogout(){if(client&&session?.role==='admin')await client.auth.signOut();if(adminChannel){client.removeChannel(adminChannel);adminChannel=null}originalLogout();loadPublicConversation()}
 
   function realtimeAdminChats(){
-    if(localDemoMode)return head('Atención comercial','Consultas de clientes','Chat demostrativo local: los mensajes se guardan en este navegador y administración puede responder desde aquí.')+`<div class="chat-alert">Modo demostración local. Para sincronizar con otros dispositivos hay que reactivar Supabase.</div>`+originalAdminChats();
+    if(localDemoMode)return `<div class="chat-alert">Modo demostración local. Los mensajes se comparten entre pestañas de este navegador; para sincronizarlos con otros dispositivos hay que reactivar Supabase.</div>`+originalAdminChats();
     const status=`<div class="chat-sync">${chatState==='online'?'Sincronización en tiempo real activa':'Conectando con las consultas…'}</div>`;
     const cards=db.chats.length?db.chats.map(c=>`<article class="card"><div class="row"><div><h2>${esc(c.name)}</h2><div class="meta">${esc(c.contact||'Sin contacto')}</div></div><span class="badge ${c.status==='open'?'amber':'green'}">${c.status==='open'?'Abierta':'Atendida'}</span></div><div class="chat-card-messages">${c.messages.map(m=>`<div class="bubble ${m.from==='client'?'client':'company'}">${esc(m.text)}<small>${new Date(m.time).toLocaleTimeString('es-UY',{hour:'2-digit',minute:'2-digit'})}</small></div>`).join('')}</div><form onsubmit="adminReply(event,'${c.id}')"><div class="row"><input class="input" name="text" maxlength="2000" required placeholder="Responder como TaskForce"><button class="btn primary">Enviar</button></div></form><div class="actions"><button class="btn small" onclick="createFromChat('${c.id}')">Convertir en trabajo</button><button class="btn small ghost" onclick="closeChatCase('${c.id}')">Marcar atendida</button></div></article>`).join(''):`<div class="card chat-empty">${empty('Todavía no hay consultas reales')}</div>`;
     return head('Atención comercial','Consultas de clientes','Los mensajes se sincronizan entre celulares y computadoras en tiempo real.')+(chatState==='error'?'<div class="chat-alert">Chat remoto sin conexión. El panel sigue disponible; los mensajes nuevos se sincronizarán al restablecer Supabase.</div>':'')+status+`<div class="grid two">${cards}</div>`;
   }
 
   window.renderChat=renderRealtimeChat;
-  window.toggleChat=function(){if(localDemoMode){originalToggleChat();return}chatOpen=!chatOpen;renderRealtimeChat();if(chatOpen&&!publicConversation)loadPublicConversation()};
+  window.toggleChat=function(){if(localDemoMode){chatOpen=!chatOpen;renderLocalChat();return}chatOpen=!chatOpen;renderRealtimeChat();if(chatOpen&&!publicConversation)loadPublicConversation()};
   window.startRealtimeChat=startRealtimeChat;
-  window.sendPublicMessage=function(event){if(localDemoMode){originalSendPublicMessage(event);return}sendRealtimeMessage(event)};
+  window.sendPublicMessage=function(event){if(localDemoMode){sendLocalMessage(event);return}sendRealtimeMessage(event)};
   window.login=realtimeLogin;
   window.logout=realtimeLogout;
   window.adminReply=function(event,id){if(localDemoMode){originalAdminReply(event,id);return}realtimeAdminReply(event,id)};
   window.closeChatCase=function(id){if(localDemoMode){originalCloseChatCase(id);return}realtimeCloseChat(id)};
   window.adminChats=realtimeAdminChats;
 
+  function renderLocalChat(){originalRenderChat();const label=document.querySelector('.chat-head small');if(label)label.textContent='Demostración local · mismo navegador'}
+  function sendLocalMessage(event){event.preventDefault();const conversation=db.chats.find(c=>c.id===localStorage.getItem('taskforce_public_chat'));if(!conversation)return;const data=new FormData(event.currentTarget),text=String(data.get('text')||'').trim();if(conversation.name==='Visitante'){conversation.name=String(data.get('name')||'').trim();conversation.contact=String(data.get('contact')||'').trim()}if(!text||!conversation.name||!conversation.contact)return;conversation.messages.push({from:'client',text,time:Date.now()});save();renderLocalChat()}
+  window.addEventListener('storage',event=>{
+    if(event.key!=='taskforce_db'||!event.newValue)return;
+    try{const updated=JSON.parse(event.newValue);if(updated?.version!==7)return;db=updated;
+      if(localDemoMode&&session?.role==='admin'&&screen==='internal'&&page==='chats')app();
+      else if(localDemoMode&&screen==='public'&&chatOpen)renderLocalChat();
+    }catch(error){console.warn('No se pudo actualizar el chat local desde otra pestaña.',error)}
+  });
+
   if(configured){
     client.auth.onAuthStateChange((event,current)=>{if(event==='SIGNED_IN'&&current?.user?.email&&session?.role==='admin')setTimeout(loadAdminChats,0)});
     if(session?.role==='admin'){
-      // La sesión demo guardada debe dejar entrar al panel aunque el backend no responda.
       if(!navigator.onLine||!client){localDemoMode=true;chatState='error'}
       else loadAdminChats();
-    }else if(!configured){localDemoMode=true;chatState='error'}
+    }else if(!navigator.onLine){localDemoMode=true;chatState='error'}
     else loadPublicConversation();
-  }
+  }else{localDemoMode=true;chatState='error'}
   app();
 })();
