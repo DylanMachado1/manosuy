@@ -26,6 +26,23 @@
   function stateClass(){return chatState==='online'?'online':chatState==='error'||chatState==='unconfigured'?'error':''}
   function publicChatId(){return localStorage.getItem('taskforce_public_chat_remote')||''}
 
+  async function assertAdminAuth(){
+    if(!client)throw new Error('Supabase no está configurado');
+    const {data,error}=await client.auth.getSession();
+    if(error)throw error;
+    if(data.session?.user?.email?.toLowerCase()!=='admin@taskforce.uy'){
+      const authError=new Error('La sesión de administración no está autenticada en Supabase.');
+      authError.code='TASKFORCE_ADMIN_AUTH_REQUIRED';
+      throw authError;
+    }
+  }
+
+  function returnAdminToLogin(){
+    if(adminChannel){client.removeChannel(adminChannel);adminChannel=null}
+    session=null;screen='login';page='home';localDemoMode=false;save();app();
+    toast('Iniciá sesión con la cuenta de administración para ver las consultas reales.');
+  }
+
   async function ensureAnonymous(){
     if(!client)return null;
     const {data}=await client.auth.getSession();
@@ -127,13 +144,14 @@
     if(!client||session?.role!=='admin'||adminLoading)return;
     adminLoading=true;
     try{
+      await assertAdminAuth();
       const {data:conversations,error}=await client.from('chat_conversations').select('*').order('updated_at',{ascending:false});
       if(error)throw error;
       const ids=(conversations||[]).map(c=>c.id);let messages=[];
       if(ids.length){const result=await client.from('chat_messages').select('*').in('conversation_id',ids).order('created_at');if(result.error)throw result.error;messages=result.data||[]}
       db.chats=(conversations||[]).map(c=>conversationShape(c,messages.filter(m=>m.conversation_id===c.id).map(messageShape)));
       save();chatState='online';subscribeAdmin();app();
-    }catch(error){console.error('TaskForce admin chat:',error);chatState='error';adminRealtimeStatus='error';if(screen==='internal'&&page==='chats')renderAdminChatView();toast('No se pudieron actualizar las consultas. Reintentaremos automáticamente.')}
+    }catch(error){console.error('TaskForce admin chat:',error);if(error.code==='TASKFORCE_ADMIN_AUTH_REQUIRED'){returnAdminToLogin();return}chatState='error';adminRealtimeStatus='error';if(screen==='internal'&&page==='chats')renderAdminChatView();toast('No se pudieron actualizar las consultas. Reintentaremos automáticamente.')}
     finally{adminLoading=false}
   }
 
@@ -164,6 +182,7 @@
     if(!client||session?.role!=='admin'||adminLoading||adminPolling||document.visibilityState==='hidden')return;
     adminPolling=true;
     try{
+      await assertAdminAuth();
       const {data:conversations,error}=await client.from('chat_conversations').select('*').order('updated_at',{ascending:false});
       if(error)throw error;
       const ids=(conversations||[]).map(c=>c.id);let messages=[];
@@ -173,7 +192,7 @@
       db.chats=next;save();
       if(changed&&screen==='internal'&&page==='chats')renderAdminChatView();
       if(adminRealtimeStatus==='error')chatState='online';
-    }catch(error){console.warn('Chat: reintento automático pendiente.',error);adminRealtimeStatus='error';chatState='error';if(screen==='internal'&&page==='chats')renderAdminChatView()}
+    }catch(error){if(error.code==='TASKFORCE_ADMIN_AUTH_REQUIRED'){returnAdminToLogin();return}console.warn('Chat: reintento automático pendiente.',error);adminRealtimeStatus='error';chatState='error';if(screen==='internal'&&page==='chats')renderAdminChatView()}
     finally{adminPolling=false}
   }
 
@@ -253,8 +272,14 @@
   if(configured){
     client.auth.onAuthStateChange((event,current)=>{if(event==='SIGNED_IN'&&current?.user?.email&&session?.role==='admin')setTimeout(loadAdminChats,0)});
     if(session?.role==='admin'){
-      if(!navigator.onLine||!client){chatState='error';adminRealtimeStatus='error'}
-      else loadAdminChats();
+      screen='login';localDemoMode=false;
+      if(!navigator.onLine||!client){chatState='error';adminRealtimeStatus='error';session=null;save()}
+      else client.auth.getSession().then(({data,error})=>{
+        if(error||data.session?.user?.email?.toLowerCase()!=='admin@taskforce.uy'){
+          session=null;screen='login';page='home';save();app();toast('Volvé a ingresar con la cuenta de administración para ver los mensajes reales.');return;
+        }
+        session={role:'admin',id:db.admins.find(x=>x.email.toLowerCase()==='admin@taskforce.uy')?.id||'admin'};screen='internal';page='home';save();app();loadAdminChats();
+      }).catch(error=>{console.warn('No se pudo recuperar la sesión administrativa.',error);session=null;screen='login';page='home';save();app();toast('Iniciá sesión nuevamente para continuar.')});
     }else if(!navigator.onLine){chatState='error'}
     else loadPublicConversation();
   }else{localDemoMode=true;chatState='error'}
