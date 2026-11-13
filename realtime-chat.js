@@ -7,10 +7,16 @@
   let publicConversation=null;
   let publicMessages=[];
   let publicChannel=null;
+  let publicChannelId='';
   let adminChannel=null;
+  let adminReconnectTimer=null;
+  let publicReconnectTimer=null;
   let chatState=configured?'connecting':'unconfigured';
+  let adminRealtimeStatus='connecting';
   let adminLoading=false;
+  let adminPolling=false;
   let refreshTimer=null;
+  let pollTimer=null;
 
   window.taskforceRealtime={configured,client};
 
@@ -41,24 +47,40 @@
       if(!conversation){localStorage.removeItem('taskforce_public_chat_remote');publicConversation=null;publicMessages=[];chatState='online';if(chatOpen)renderChat();return}
       const {data:messages,error:messageError}=await client.from('chat_messages').select('*').eq('conversation_id',id).order('created_at');
       if(messageError)throw messageError;
-      publicConversation=conversationShape(conversation);
-      publicMessages=(messages||[]).map(messageShape);
+      const nextConversation=conversationShape(conversation),nextMessages=(messages||[]).map(messageShape);
+      const changed=!publicConversation||publicConversation.status!==nextConversation.status||JSON.stringify(publicMessages)!==JSON.stringify(nextMessages);
+      publicConversation=nextConversation;
+      publicMessages=nextMessages;
       subscribePublic(id);
       chatState='online';
-      if(chatOpen)renderChat();
-    }catch(error){console.error('TaskForce chat:',error);chatState='error';localDemoMode=true;if(chatOpen)renderLocalChat()}
+      if(chatOpen&&changed)renderPublicChatKeepingDraft();
+    }catch(error){console.error('TaskForce chat:',error);chatState='error';if(chatOpen)renderChat()}
   }
 
   function subscribePublic(id){
+    if(publicChannel&&publicChannelId===id)return;
     if(publicChannel)client.removeChannel(publicChannel);
+    publicChannelId=id;
     publicChannel=client.channel('public-chat-'+id)
       .on('postgres_changes',{event:'INSERT',schema:'public',table:'chat_messages',filter:'conversation_id=eq.'+id},payload=>{
         if(!publicMessages.some(m=>String(m.id)===String(payload.new.id)))publicMessages.push(messageShape(payload.new));
-        if(chatOpen)renderChat();
+        if(chatOpen)renderPublicChatKeepingDraft();
         else document.querySelector('.chat-launch .unread')?.classList.add('live');
       })
       .on('postgres_changes',{event:'UPDATE',schema:'public',table:'chat_conversations',filter:'id=eq.'+id},payload=>{if(publicConversation)publicConversation.status=payload.new.status;if(chatOpen)renderChat()})
-      .subscribe(status=>{if(status==='SUBSCRIBED'){chatState='online';if(chatOpen)renderChat()}if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'){chatState='error';if(chatOpen)renderChat()}});
+      .subscribe(status=>{
+        if(status==='SUBSCRIBED'){clearTimeout(publicReconnectTimer);chatState='online';if(chatOpen)renderPublicChatKeepingDraft()}
+        if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
+          chatState='error';if(chatOpen)renderChat();clearTimeout(publicReconnectTimer);
+          publicReconnectTimer=setTimeout(()=>{if(id===publicChannelId&&navigator.onLine){if(publicChannel){client.removeChannel(publicChannel);publicChannel=null}subscribePublic(id)}},10000);
+        }
+      });
+  }
+
+  function renderPublicChatKeepingDraft(){
+    const draft=document.querySelector('.chat-form input[name="text"]')?.value||'';
+    renderChat();
+    const field=document.querySelector('.chat-form input[name="text"]');if(field)field.value=draft;
   }
 
   async function startRealtimeChat(event){
@@ -74,7 +96,7 @@
       publicConversation=conversationShape(conversation);publicMessages=[];chatState='online';
       subscribePublic(conversation.id);
       await loadPublicConversation();
-    }catch(error){console.error(error);chatState='error';localDemoMode=true;toast('Chat local de demostración activado.');renderLocalChat()}
+    }catch(error){console.error('No se pudo iniciar el chat remoto:',error);chatState='error';toast('No se pudo conectar con TaskForce. Revisá tu conexión e intentá nuevamente.');renderChat()}
     finally{button.disabled=false}
   }
 
@@ -111,18 +133,51 @@
       if(ids.length){const result=await client.from('chat_messages').select('*').in('conversation_id',ids).order('created_at');if(result.error)throw result.error;messages=result.data||[]}
       db.chats=(conversations||[]).map(c=>conversationShape(c,messages.filter(m=>m.conversation_id===c.id).map(messageShape)));
       save();chatState='online';subscribeAdmin();app();
-    }catch(error){console.error('TaskForce admin chat:',error);chatState='error';localDemoMode=true;app();toast('Chat local de demostración activado.')}
+    }catch(error){console.error('TaskForce admin chat:',error);chatState='error';adminRealtimeStatus='error';if(screen==='internal'&&page==='chats')renderAdminChatView();toast('No se pudieron actualizar las consultas. Reintentaremos automáticamente.')}
     finally{adminLoading=false}
   }
 
   function subscribeAdmin(){
-    if(adminChannel)return;
+    if(adminChannel){client.removeChannel(adminChannel);adminChannel=null}
     adminChannel=client.channel('taskforce-admin-chat')
       .on('postgres_changes',{event:'*',schema:'public',table:'chat_conversations'},scheduleAdminRefresh)
       .on('postgres_changes',{event:'*',schema:'public',table:'chat_messages'},scheduleAdminRefresh)
-      .subscribe();
+      .subscribe(status=>{
+        adminRealtimeStatus=status==='SUBSCRIBED'?'online':(['CHANNEL_ERROR','TIMED_OUT','CLOSED'].includes(status)?'error':'connecting');
+        if(adminRealtimeStatus==='online'){clearTimeout(adminReconnectTimer);scheduleAdminRefresh()}
+        else if(adminRealtimeStatus==='error'){
+          clearTimeout(adminReconnectTimer);
+          adminReconnectTimer=setTimeout(()=>{if(session?.role==='admin'&&navigator.onLine)subscribeAdmin()},10000);
+        }
+        if(screen==='internal'&&page==='chats')renderAdminChatView();
+      });
   }
-  function scheduleAdminRefresh(){clearTimeout(refreshTimer);refreshTimer=setTimeout(loadAdminChats,180)}
+  function renderAdminChatView(){
+    const drafts=new Map([...document.querySelectorAll('[data-chat-id]')].map(card=>[card.dataset.chatId,card.querySelector('input[name="text"]')?.value||'']));
+    const scrollY=window.scrollY;
+    app();
+    for(const card of document.querySelectorAll('[data-chat-id]')){const field=card.querySelector('input[name="text"]');if(field&&drafts.has(card.dataset.chatId))field.value=drafts.get(card.dataset.chatId)}
+    window.scrollTo(0,scrollY);
+  }
+
+  async function pollAdminChats(){
+    if(!client||session?.role!=='admin'||adminLoading||adminPolling||document.visibilityState==='hidden')return;
+    adminPolling=true;
+    try{
+      const {data:conversations,error}=await client.from('chat_conversations').select('*').order('updated_at',{ascending:false});
+      if(error)throw error;
+      const ids=(conversations||[]).map(c=>c.id);let messages=[];
+      if(ids.length){const result=await client.from('chat_messages').select('*').in('conversation_id',ids).order('created_at');if(result.error)throw result.error;messages=result.data||[]}
+      const next=(conversations||[]).map(c=>conversationShape(c,messages.filter(m=>m.conversation_id===c.id).map(messageShape)));
+      const changed=JSON.stringify(next)!==JSON.stringify(db.chats);
+      db.chats=next;save();
+      if(changed&&screen==='internal'&&page==='chats')renderAdminChatView();
+      if(adminRealtimeStatus==='error')chatState='online';
+    }catch(error){console.warn('Chat: reintento automático pendiente.',error);adminRealtimeStatus='error';chatState='error';if(screen==='internal'&&page==='chats')renderAdminChatView()}
+    finally{adminPolling=false}
+  }
+
+  function scheduleAdminRefresh(){clearTimeout(refreshTimer);refreshTimer=setTimeout(pollAdminChats,180)}
 
   async function realtimeAdminReply(event,id){
     event.preventDefault();const form=event.currentTarget,text=String(new FormData(form).get('text')||'').trim(),button=form.querySelector('button');if(!text)return;
@@ -157,8 +212,8 @@
       const {error}=await client.auth.signInWithPassword({email,password});
       if(error)throw error;
     }catch(error){
-      console.error('Supabase admin sign-in failed; using local demo:',error);
-      enterLocalDemo(admin,button);
+      console.error('Supabase admin sign-in failed:',error);
+      button.disabled=false;button.textContent='Ingresar';toast('No se pudo validar el acceso. Revisá el correo y la contraseña.');
       return;
     }
     session={role:'admin',id:admin.id};screen='internal';page='home';save();app();loadAdminChats();
@@ -169,9 +224,10 @@
 
   function realtimeAdminChats(){
     if(localDemoMode)return `<div class="chat-alert">Modo demostración local. Los mensajes se comparten entre pestañas de este navegador; para sincronizarlos con otros dispositivos hay que reactivar Supabase.</div>`+originalAdminChats();
-    const status=`<div class="chat-sync">${chatState==='online'?'Sincronización en tiempo real activa':'Conectando con las consultas…'}</div>`;
-    const cards=db.chats.length?db.chats.map(c=>`<article class="card"><div class="row"><div><h2>${esc(c.name)}</h2><div class="meta">${esc(c.contact||'Sin contacto')}</div></div><span class="badge ${c.status==='open'?'amber':'green'}">${c.status==='open'?'Abierta':'Atendida'}</span></div><div class="chat-card-messages">${c.messages.map(m=>`<div class="bubble ${m.from==='client'?'client':'company'}">${esc(m.text)}<small>${new Date(m.time).toLocaleTimeString('es-UY',{hour:'2-digit',minute:'2-digit'})}</small></div>`).join('')}</div><form onsubmit="adminReply(event,'${c.id}')"><div class="row"><input class="input" name="text" maxlength="2000" required placeholder="Responder como TaskForce"><button class="btn primary">Enviar</button></div></form><div class="actions"><button class="btn small" onclick="createFromChat('${c.id}')">Convertir en trabajo</button><button class="btn small ghost" onclick="closeChatCase('${c.id}')">Marcar atendida</button></div></article>`).join(''):`<div class="card chat-empty">${empty('Todavía no hay consultas reales')}</div>`;
-    return head('Atención comercial','Consultas de clientes','Los mensajes se sincronizan entre celulares y computadoras en tiempo real.')+(chatState==='error'?'<div class="chat-alert">Chat remoto sin conexión. El panel sigue disponible; los mensajes nuevos se sincronizarán al restablecer Supabase.</div>':'')+status+`<div class="grid two">${cards}</div>`;
+    const syncLabel=adminRealtimeStatus==='online'?'En vivo · respaldo automático cada 5 segundos':adminRealtimeStatus==='error'?'Reintentando · respaldo automático cada 5 segundos':adminRealtimeStatus==='polling'?'Actualización automática cada 5 segundos':'Conectando con las consultas…';
+    const status=`<div class="chat-sync">${syncLabel}</div>`;
+    const cards=db.chats.length?db.chats.map(c=>`<article class="card" data-chat-id="${c.id}"><div class="row"><div><h2>${esc(c.name)}</h2><div class="meta">${esc(c.contact||'Sin contacto')}</div></div><span class="badge ${c.status==='open'?'amber':'green'}">${c.status==='open'?'Abierta':'Atendida'}</span></div><div class="chat-card-messages">${c.messages.map(m=>`<div class="bubble ${m.from==='client'?'client':'company'}">${esc(m.text)}<small>${new Date(m.time).toLocaleTimeString('es-UY',{hour:'2-digit',minute:'2-digit'})}</small></div>`).join('')}</div><form onsubmit="adminReply(event,'${c.id}')"><div class="row"><input class="input" name="text" maxlength="2000" required placeholder="Responder como TaskForce"><button class="btn primary">Enviar</button></div></form><div class="actions"><button class="btn small" onclick="createFromChat('${c.id}')">Convertir en trabajo</button><button class="btn small ghost" onclick="closeChatCase('${c.id}')">Marcar atendida</button></div></article>`).join(''):`<div class="card chat-empty">${empty('Todavía no hay consultas reales')}</div>`;
+    return head('Atención comercial','Consultas de clientes','Los mensajes se sincronizan entre celulares y computadoras en tiempo real.')+(chatState==='error'?'<div class="chat-alert">No se pudo actualizar en este momento. Reintentando automáticamente; los mensajes guardados no se pierden.</div>':'')+status+`<div class="grid two">${cards}</div>`;
   }
 
   window.renderChat=renderRealtimeChat;
@@ -197,10 +253,25 @@
   if(configured){
     client.auth.onAuthStateChange((event,current)=>{if(event==='SIGNED_IN'&&current?.user?.email&&session?.role==='admin')setTimeout(loadAdminChats,0)});
     if(session?.role==='admin'){
-      if(!navigator.onLine||!client){localDemoMode=true;chatState='error'}
+      if(!navigator.onLine||!client){chatState='error';adminRealtimeStatus='error'}
       else loadAdminChats();
-    }else if(!navigator.onLine){localDemoMode=true;chatState='error'}
+    }else if(!navigator.onLine){chatState='error'}
     else loadPublicConversation();
   }else{localDemoMode=true;chatState='error'}
+  if(configured){
+    pollTimer=setInterval(()=>{
+      if(session?.role==='admin')pollAdminChats();
+      else if(publicConversation&&document.visibilityState!=='hidden')loadPublicConversation();
+    },5000);
+    window.addEventListener('online',()=>{
+      if(session?.role==='admin'){subscribeAdmin();pollAdminChats()}
+      else loadPublicConversation();
+    });
+    document.addEventListener('visibilitychange',()=>{
+      if(document.visibilityState!=='visible')return;
+      if(session?.role==='admin')pollAdminChats();
+      else if(publicConversation)loadPublicConversation();
+    });
+  }
   app();
 })();
